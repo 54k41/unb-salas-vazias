@@ -167,10 +167,10 @@
     <p>Dados em tempo real do sistema de salas da <span>UnB</span></p>
   </header>
 
-  <div class="controls">
+<div class="controls">
     <label for="hora">Horário:</label>
     <input type="time" id="hora" value="08:00">
-    <select id="dia">
+<select id="dia" aria-label="Dia da semana">
       <option value="hoje" selected>Hoje</option>
       <option value="2">Segunda-feira</option>
       <option value="3">Terça-feira</option>
@@ -180,8 +180,10 @@
       <option value="7">Sábado</option>
     </select>
     <button class="now-btn" id="btnAgora">🕐 Agora</button>
+    <button class="now-btn" id="btnAtualizar"
+      title="Ignora o cache e consulta a API de novo">🔄 Atualizar</button>
     <button id="btnConsultar">Consultar</button>
-  </div>
+</div>
 
   <div class="status-line" id="status"></div>
 
@@ -219,27 +221,112 @@ const SALAS = [
 const API = 'https://servicos.unb.br/agenda-api/relatorio/agenda-local?id=';
 const DIAS_SEMANA = { 2: 'Segunda', 3: 'Terça', 4: 'Quarta', 5: 'Quinta', 6: 'Sexta', 7: 'Sábado' };
 
+// A agenda é da UnB: "hoje", "agora" e a validade do cache seguem sempre o
+// fuso de Brasília, nunca o do navegador de quem acessa.
+const TZ = 'America/Sao_Paulo';
+const fmtPartesBrasilia = new Intl.DateTimeFormat('pt-BR', {
+  timeZone: TZ,
+  year: 'numeric', month: '2-digit', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+});
+const fmtDiaLongoBrasilia = new Intl.DateTimeFormat('pt-BR', {
+  timeZone: TZ, weekday: 'long', day: '2-digit', month: '2-digit',
+});
+
+// Fonte única de tempo: quebra um instante (por padrão, agora) nas partes do
+// fuso de Brasília. Receber o Date de fora permite que quem precisa de duas
+// leituras coerentes (dia + texto do dia) use o mesmo instante.
+function agoraBrasilia(instante = new Date()) {
+  const p = {};
+  for (const { type, value } of fmtPartesBrasilia.formatToParts(instante)) p[type] = value;
+  return {
+    dia: parseInt(p.day, 10),
+    mes: parseInt(p.month, 10),
+    ano: parseInt(p.year, 10),
+    hora: parseInt(p.hour, 10),
+    minuto: parseInt(p.minute, 10),
+  };
+}
+
+// JS: 0=dom..6=sab — calculado a partir da data de Brasília, sem depender de
+// nomes de dia localizados.
+function diaSemanaDe(partes) {
+  return new Date(Date.UTC(partes.ano, partes.mes - 1, partes.dia)).getUTCDay();
+}
+
+function diaSemanaAgora() {
+  return diaSemanaDe(agoraBrasilia());
+}
+
+function horaAgoraBrasilia() {
+  const { hora, minuto } = agoraBrasilia();
+  return String(hora).padStart(2, '0') + ':' + String(minuto).padStart(2, '0');
+}
+
+// Identificador do dia corrente em Brasília — é a chave de validade do cache
+// (a agenda é semanal, então vale só para o dia em que foi buscada).
+function chaveDiaBrasilia(instante = new Date()) {
+  const { dia, mes, ano } = agoraBrasilia(instante);
+  return ano + '-' + mes + '-' + dia;
+}
+
 const grid = document.getElementById('grid');
 const statusEl = document.getElementById('status');
 const horaInput = document.getElementById('hora');
 const diaSelect = document.getElementById('dia');
 const btnConsultar = document.getElementById('btnConsultar');
 const btnAgora = document.getElementById('btnAgora');
+const btnAtualizar = document.getElementById('btnAtualizar');
 
-// Armazena as agendas carregadas (cache por id; a agenda é semanal, então
-// o cache vale só para o dia corrente e é limpo na virada do dia)
-const cacheAgendas = { __dia: null };
+// Cache das agendas por sala. A agenda é semanal, mas reservas podem entrar a
+// qualquer momento: cada entrada guarda o instante em que foi buscada e vale
+// por TTL_CACHE_MS. Passado o prazo, a sala é consultada de novo.
+const cacheAgendas = { __dia: null }; // id -> { d, em }
+const TTL_CACHE_MS = 60000;
+
+// Requisições em andamento, por id: consultas sobrepostas reaproveitam o mesmo
+// fetch em vez de baixar a mesma sala duas vezes.
+const requisicoesEmVoo = {};
+
+const TIMEOUT_FETCH_MS = 12000;
 
 function limparCacheSeNovoDia() {
-  const hoje = new Date().toDateString();
-  if (cacheAgendas.__dia !== hoje) {
+  const chave = chaveDiaBrasilia();
+  if (cacheAgendas.__dia !== chave) {
     for (const k of Object.keys(cacheAgendas)) delete cacheAgendas[k];
-    cacheAgendas.__dia = hoje;
+    for (const k of Object.keys(requisicoesEmVoo)) delete requisicoesEmVoo[k];
+    cacheAgendas.__dia = chave;
   }
+}
+
+function cacheAindaVale(sala, forcar) {
+  if (forcar) return false;
+  const e = cacheAgendas[sala.id];
+  return !!e && (Date.now() - e.em) < TTL_CACHE_MS;
+}
+
+// idade do dado mais antigo entre as salas efetivamente exibidas, em ms: deixa
+// visível no status que a tela pode estar desatualizada
+function idadeDoDado(resultados) {
+  let maisAntigo = 0;
+  const agora = Date.now();
+  for (const r of resultados) {
+    if (r.erro) continue; // sala sem resposta não exibe dado
+    const e = cacheAgendas[r.id];
+    if (e) maisAntigo = Math.max(maisAntigo, agora - e.em);
+  }
+  return maisAntigo;
+}
+
+function idadeTexto(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return 'há ' + s + 's';
+  return 'há ' + Math.round(s / 60) + 'min';
 }
 
 // "08:00h - 08:55h" => {ini: 480, fim: 535} (minutos)
 function parseLabel(label) {
+  if (typeof label !== 'string') return null;
   const m = label.match(/(\d{1,2}):(\d{2})\s*h?\s*-\s*(\d{1,2}):(\d{2})/);
   if (!m) return null;
   return {
@@ -253,187 +340,572 @@ function hmParaMin(hhmm) {
   return h * 60 + m;
 }
 
-async function carregarSala(sala) {
+// Formato que o <input type="time"> entrega (e que o resto do script espera).
+const RE_HORA = /^([01]\d|2[0-3]):[0-5]\d$/;
+
+// Um fetch da API, com timeout: sem ele uma API pendurada deixaria o spinner
+// e os botões travados indefinidamente.
+async function buscarAgenda(sala) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), TIMEOUT_FETCH_MS);
+  try {
+    const r = await fetch(API + sala.id, { signal: ctrl.signal });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const j = await r.json();
+    // Envelope da API: { success, status, error, message, data }. Uma falha de
+    // backend pode vir com HTTP 200: isso é erro e não pode ser cacheado como
+    // se fosse "sala sem agenda" (senão a sala só seria reconsultada amanhã).
+    if (!j || typeof j !== 'object') throw new Error('resposta inesperada');
+    if (j.success === false) throw new Error(j.error || j.message || 'success=false');
+    const d = j.data;
+    if (Array.isArray(d)) return d[0] || null;
+    if (d && typeof d === 'object') return d;
+    return null;
+  } catch (e) {
+    if (e && e.name === 'AbortError') throw new Error('tempo esgotado (' + TIMEOUT_FETCH_MS + ' ms)');
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function carregarSala(sala, forcar = false, tentativas = 1) {
   limparCacheSeNovoDia();
-  if (sala.id in cacheAgendas) return cacheAgendas[sala.id];
-  const r = await fetch(API + sala.id);
-  if (!r.ok) throw new Error('HTTP ' + r.status);
-  const j = await r.json();
-  const d = (j.data && j.data[0]) || null;
-  cacheAgendas[sala.id] = d;
-  return d;
+  const chaveDia = cacheAgendas.__dia; // dia em que esta busca começou
+  if (cacheAindaVale(sala, forcar)) return cacheAgendas[sala.id].d;
+
+  // requisição em voo é fresca por definição: pode ser reaproveitada mesmo
+  // quando o usuário pediu atualização forçada
+  let emVoo = requisicoesEmVoo[sala.id];
+  const dono = !emVoo;
+  if (dono) {
+    emVoo = (async () => {
+      const d = await buscarAgenda(sala);
+      // Só grava se o dia não virou durante o fetch: uma resposta começada na
+      // semana anterior não pode ser cacheada como se fosse da semana atual.
+      if (chaveDiaBrasilia() === chaveDia) cacheAgendas[sala.id] = { d, em: Date.now() };
+      return d;
+    })();
+    requisicoesEmVoo[sala.id] = emVoo;
+  }
+
+  let dados;
+  try {
+    dados = await emVoo;
+  } finally {
+    if (dono && requisicoesEmVoo[sala.id] === emVoo) delete requisicoesEmVoo[sala.id];
+  }
+
+  // O dia virou no meio da busca, inclusive quando esta chamada apenas
+  // reaproveitou uma requisição pendente de outra consulta: descarta o
+  // resultado e busca de novo sob a chave nova, uma única vez.
+  if (chaveDiaBrasilia() !== chaveDia) {
+    return tentativas > 0 ? carregarSala(sala, forcar, tentativas - 1) : dados;
+  }
+  return dados;
 }
 
-// d = {dia2..dia7}; retorna as aulas do dia escolhido e quantos rótulos não
-// casaram com o padrão de horário (descartados, para sinalizar na interface)
+// d = {dia2..dia7}; devolve as aulas do dia escolhido, quantos itens têm
+// horário fora do padrão e se o dado do dia veio em formato inesperado
+// (dia ausente = sala sem aulas naquele dia; dia presente e ilegível =
+// não dá para afirmar que a sala está vazia).
 function aulasDoDia(d, diaSemana) {
-  if (!d) return { aulas: [], ignorados: 0 };
+  if (!d) return { aulas: [], ignorados: 0, invalido: false };
+  if (typeof d !== 'object') return { aulas: [], ignorados: 0, invalido: true };
+  const doDia = d['dia' + diaSemana];
+  if (doDia == null) return { aulas: [], ignorados: 0, invalido: false };
+  if (!Array.isArray(doDia)) return { aulas: [], ignorados: 0, invalido: true };
   let ignorados = 0;
-  const arr = d['dia' + diaSemana] || [];
-  const aulas = arr
-    .map(x => ({ ...parseLabel(x.label), turma: x.turma, label: x.label }))
-    .filter(x => {
-      if (x.ini == null) { ignorados++; return false; }
-      return true;
-    });
-  return { aulas, ignorados };
+  const aulas = [];
+  for (const item of doDia) {
+    const label = item && typeof item.label === 'string' ? item.label : '';
+    const faixa = parseLabel(label);
+    if (!faixa) { ignorados++; continue; }
+    aulas.push({ ini: faixa.ini, fim: faixa.fim, turma: item && item.turma, label });
+  }
+  return { aulas, ignorados, invalido: false };
 }
 
-function ocupadaNoHorario(aulas, minutos) {
-  return aulas.find(a => minutos >= a.ini && minutos < a.fim) || null;
+// A API devolve as reservas na ordem de cadastro, não por horário, e quebra
+// toda aula de 2 créditos em dois registros seguidos (08:00-08:55 e
+// 08:55-09:50). Sem ordenar e sem fundir os pedaços da mesma turma, o card
+// anuncia a sala livre no meio da aula.
+function consolidarReservas(aulas) {
+  const porTurma = new Map();
+  for (const a of aulas) {
+    const chave = String(a.turma == null ? '' : a.turma);
+    const lista = porTurma.get(chave) || [];
+    lista.push(a);
+    porTurma.set(chave, lista);
+  }
+  const saida = [];
+  for (const lista of porTurma.values()) {
+    lista.sort((x, y) => x.ini - y.ini || x.fim - y.fim);
+    let atual = null;
+    for (const a of lista) {
+      if (atual && a.ini <= atual.fim) {
+        // encadeia o próximo pedaço da mesma turma (ou funde duplicatas)
+        atual.fim = Math.max(atual.fim, a.fim);
+        atual.registros++;
+      } else {
+        atual = { ini: a.ini, fim: a.fim, turma: a.turma, registros: 1 };
+        saida.push(atual);
+      }
+    }
+  }
+  saida.sort((x, y) => x.ini - y.ini || y.fim - x.fim);
+  return saida;
 }
 
-function proximoCompromisso(aulas, minutos) {
-  const futuras = aulas.filter(a => a.ini >= minutos).sort((a, b) => a.ini - b.ini);
-  return futuras[0] || null;
+// Reservas que cobrem o minuto consultado: pode haver mais de uma ao mesmo
+// tempo (turmas conjuntas, evento sobrepondo aulas).
+function reservasNoHorario(reservas, minutos) {
+  return reservas.filter(a => minutos >= a.ini && minutos < a.fim);
+}
+
+// Fim da sequência contínua de reservas a partir do minuto consultado: a sala
+// pode seguir ocupada depois do fim da reserva que está na tela, porque outra
+// começa exatamente quando esta termina.
+function fimDoBloco(reservas, minutos) {
+  let fim = minutos;
+  let avancou = true;
+  while (avancou) {
+    avancou = false;
+    for (const a of reservas) {
+      if (a.ini <= fim && a.fim > fim) { fim = a.fim; avancou = true; }
+    }
+  }
+  return fim;
+}
+
+function fmtMin(minutos) {
+  return String(Math.floor(minutos / 60)).padStart(2, '0') + ':'
+    + String(minutos % 60).padStart(2, '0');
+}
+
+// "08:00h - 09:50h", no mesmo formato dos rótulos da API
+function faixaTexto(ini, fim) {
+  return fmtMin(ini) + 'h - ' + fmtMin(fim) + 'h';
+}
+
+// Lê o horário do campo sem nunca reescrevê-lo. O picker nativo permite
+// apagar o campo (no WebKit ele fica vazio enquanto o usuário digita), e
+// substituir o que está escrito pelo horário de agora é pior do que não
+// consultar: quem chama decide o que fazer quando vier null.
+function horarioDoCampo() {
+  const valor = String(horaInput.value || '').trim();
+  return RE_HORA.test(valor) ? valor : null;
+}
+
+function avisarHorarioIncompleto() {
+  statusEl.className = 'status-line';
+  statusEl.textContent = 'Horário incompleto — informe HH:MM ou toque em «Agora».';
+}
+
+// Monta o cartão de uma sala e informa o estado apurado: erro | semdados |
+// invalido | ilegivel | ocupada | livre.
+function cartaoDaSala(r, diaSemana, minutos) {
+  const div = document.createElement('div');
+  const nome = escapeHtml(r.nome);
+
+  // falha de rede: a sala não some da grade, aparece marcada com o erro
+  if (r.erro) {
+    div.className = 'room semdados';
+    div.innerHTML = `
+      <div class="name">${nome}</div>
+      <div class="badge">– Sem resposta</div>
+      <div class="info">A API não respondeu para esta sala (${escapeHtml(r.erro)}).</div>`;
+    return { div, estado: 'erro' };
+  }
+
+  const { aulas, ignorados, invalido } = aulasDoDia(r.dados, diaSemana);
+
+  // sala sem agenda: estado próprio, fora da contagem de vazias/ocupadas
+  if (r.dados == null) {
+    div.className = 'room semdados';
+    div.innerHTML = `
+      <div class="name">${nome}</div>
+      <div class="badge">– Sem dados</div>
+      <div class="info">Agenda indisponível para esta sala.</div>`;
+    return { div, estado: 'semdados' };
+  }
+
+  // resposta em formato inesperado (ex.: dia2 como texto, ou a agenda inteira
+  // como string): não se pode afirmar que a sala está vazia
+  if (invalido) {
+    div.className = 'room semdados';
+    div.innerHTML = `
+      <div class="name">${nome}</div>
+      <div class="badge">– Dados inválidos</div>
+      <div class="info">A agenda desta sala veio em formato inesperado; disponibilidade não confirmada.</div>`;
+    return { div, estado: 'invalido' };
+  }
+
+  const reservas = consolidarReservas(aulas);
+  const cobrindo = reservasNoHorario(reservas, minutos);
+  // com reservas simultâneas, manda a que segura a sala por mais tempo
+  const principal = cobrindo.reduce(
+    (melhor, a) => (melhor === null || a.fim > melhor.fim) ? a : melhor, null);
+  const prox = principal ? null : (reservas.find(a => a.ini >= minutos) || null);
+
+  // há reserva com horário ilegível e nada ocupando agora: a disponibilidade
+  // não pode ser afirmada, então vira estado próprio, fora da contagem
+  if (!principal && ignorados > 0) {
+    div.className = 'room semdados';
+    div.innerHTML = `
+      <div class="name">${nome}</div>
+      <div class="badge">– Horário ilegível</div>
+      <div class="info">Há reserva com horário fora do padrão; disponibilidade não confirmada.</div>`;
+    return { div, estado: 'ilegivel' };
+  }
+
+  let info;
+  if (principal) {
+    const fim = fimDoBloco(reservas, minutos);
+    info = `<b>${escapeHtml(principal.turma || 'Aula')}</b><br>`
+      + faixaTexto(principal.ini, principal.fim);
+    if (principal.registros > 1) info += ` (${principal.registros} aulas)`;
+    if (fim > principal.fim) info += `<br>Ocupada até ${fmtMin(fim)}`;
+    if (cobrindo.length > 1) info += `<br>(+${cobrindo.length - 1} reserva(s) no mesmo horário)`;
+  } else if (prox) {
+    info = `Próxima aula: <b>${escapeHtml(prox.turma || 'Turma não especificada')}</b><br>`
+      + faixaTexto(prox.ini, prox.fim);
+    const simultaneas = reservas.filter(a => a.ini === prox.ini).length;
+    if (simultaneas > 1) info += `<br>(+${simultaneas - 1} no mesmo horário)`;
+  } else {
+    info = 'Livre até o fim do dia ✓';
+  }
+
+  div.className = 'room ' + (principal ? 'ocupada' : 'livre');
+  div.innerHTML = `
+    <div class="name">${nome}</div>
+    <div class="badge">${principal ? '● Ocupada' : '○ Vazia'}</div>
+    <div class="info">${info}</div>`;
+  return { div, estado: principal ? 'ocupada' : 'livre' };
 }
 
 function render(resultados, diaSemana, minutos) {
   grid.innerHTML = '';
-  let livres = 0, ocupadas = 0, semDados = 0, ignorados = 0;
+  let livres = 0, ocupadas = 0, semDados = 0, incompletos = 0, erros = 0;
 
   for (const r of resultados) {
-    const div = document.createElement('div');
-    const { aulas, ignorados: ign } = aulasDoDia(r.dados, diaSemana);
-    ignorados += ign;
-
-    // sala sem agenda: estado próprio, fora da contagem de vazias/ocupadas
-    if (r.dados == null) {
-      semDados++;
+    let cartao;
+    try {
+      cartao = cartaoDaSala(r, diaSemana, minutos);
+    } catch (e) {
+      // uma sala com dado bizarro não pode derrubar a exibição das demais
+      const div = document.createElement('div');
       div.className = 'room semdados';
       div.innerHTML = `
-        <div class="name">${r.nome}</div>
-        <div class="badge">– Sem dados</div>
-        <div class="info">Agenda indisponível para esta sala.</div>`;
-      grid.appendChild(div);
-      continue;
+        <div class="name">${escapeHtml(r.nome)}</div>
+        <div class="badge">– Não foi possível ler</div>
+        <div class="info">A agenda desta sala não pôde ser interpretada.</div>`;
+      cartao = { div, estado: 'invalido' };
     }
-
-    const ocup = ocupadaNoHorario(aulas, minutos);
-    const prox = ocup ? null : proximoCompromisso(aulas, minutos);
-
-    div.className = 'room ' + (ocup ? 'ocupada' : 'livre');
-
-    let info;
-    if (ocup) {
-      info = `<b>${escapeHtml(ocup.turma || 'Aula')}</b><br>${escapeHtml(ocup.label)}`;
-    } else if (prox) {
-      info = `Próxima aula: <b>${escapeHtml(prox.turma || '')}</b><br>${escapeHtml(prox.label)}`;
-    } else {
-      info = 'Livre até o fim do dia ✓';
-    }
-
-    div.innerHTML = `
-      <div class="name">${r.nome}</div>
-      <div class="badge">${ocup ? '● Ocupada' : '○ Vazia'}</div>
-      <div class="info">${info}</div>`;
-    grid.appendChild(div);
-
-    if (ocup) ocupadas++; else livres++;
+    grid.appendChild(cartao.div);
+    if (cartao.estado === 'erro') erros++;
+    else if (cartao.estado === 'semdados') semDados++;
+    else if (cartao.estado === 'invalido' || cartao.estado === 'ilegivel') incompletos++;
+    else if (cartao.estado === 'ocupada') ocupadas++;
+    else livres++;
   }
 
   document.getElementById('nLivre').textContent = livres;
   document.getElementById('nOcup').textContent = ocupadas;
-  return { semDados, ignorados };
+  return { semDados, incompletos, erros };
 }
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
-async function consultar() {
-  const hhmm = horaInput.value || '08:00';
-  const minutos = hmParaMin(hhmm);
+// Token da consulta em curso: se o usuário disparar outra consulta antes da
+// anterior terminar, a anterior se torna obsoleta e não pode mais renderizar
+let consultaSeq = 0;
 
-  let diaSemana;
-  if (diaSelect.value === 'hoje') {
-    // JS: 0=dom..6=sab ; API: 2=seg .. 7=sab
-    const js = new Date().getDay();
-    if (js === 0) {
-      // domingo: sem aulas na semana — estado explícito, não "tudo vazio"
-      grid.innerHTML = '';
-      document.getElementById('nLivre').textContent = '–';
-      document.getElementById('nOcup').textContent = '–';
-      statusEl.className = 'status-line';
-      statusEl.textContent = 'Hoje é domingo — não há aulas nos anfiteatros.';
-      return;
-    }
-    diaSemana = js + 1;
-  } else {
-    diaSemana = parseInt(diaSelect.value);
+// Quantas consultas estão em andamento, automáticas inclusive: o relógio ao
+// vivo não começa outra por cima de uma consulta disparada pelo usuário.
+let consultasEmAndamento = 0;
+
+// Modo "agora": a tela acompanha o relógio e se atualiza sozinha. Qualquer
+// escolha explícita (outro dia, outro horário) desliga o modo, para a seleção
+// do usuário nunca ser sobrescrita pelo tique automático.
+let seguindoAgora = true;
+
+// Horário dos cartões em exibição. Se uma atualização automática falhar, o
+// campo volta para ele: um horário novo ao lado de cartões calculados para
+// outra hora seria pior do que um minuto de atraso.
+let horaRenderizada = null;
+
+// Depois de uma falha da atualização automática, espera antes de tentar de
+// novo: sem isso cada tique repetiria as 13 requisições enquanto a API
+// estivesse fora do ar.
+let bloqueioAoVivoAte = 0;
+
+// Ritmo do relógio ao vivo e espera depois de uma falha automática.
+const INTERVALO_AO_VIVO_MS = 15000;
+const ESPERA_APOS_FALHA_MS = 60000;
+
+async function consultar(forcar = false, tentativasDia = 1, modo = {}) {
+  // Atualização automática: não mexe nos controles nem anuncia "consultando"
+  // a cada minuto — o painel só troca os cartões quando os dados chegam.
+  const silencioso = modo.silencioso === true;
+
+  // Campo vazio/incompleto: não inventa um horário (isso apagaria o que o
+  // usuário está digitando) e não consulta nada.
+  const hhmm = horarioDoCampo();
+  if (hhmm === null) {
+    if (!silencioso) avisarHorarioIncompleto();
+    return;
   }
 
-  btnConsultar.disabled = true;
-  btnAgora.disabled = true;
-  statusEl.className = 'status-line';
-  statusEl.innerHTML = '<span class="spin"></span>Consultando ' + SALAS.length + ' salas…';
+  const seq = ++consultaSeq;
+  consultasEmAndamento++;
+
+  // Um único instante para tudo (dia consultado, texto do dia e chave do
+  // cache): o relógio pode cruzar a meia-noite no meio da consulta.
+  const instanteEmissao = new Date();
+  const chaveEmissao = chaveDiaBrasilia(instanteEmissao);
+  const diaTextoHoje = fmtDiaLongoBrasilia.format(instanteEmissao);
+
+  // Seleção e horário ficam congelados aqui: o usuário pode mexer nos
+  // controles com os fetches em voo, e o status tem de descrever o que foi
+  // consultado, não o que estiver selecionado quando a resposta chegar.
+  const selecao = diaSelect.value;
+  const minutos = hmParaMin(hhmm);
+
+  // Botões desabilitados antes de qualquer caminho de saída: o finally abaixo
+  // é o único lugar que os reabilita, inclusive no ramo de domingo. No modo
+  // silencioso nada disso acontece — um tique automático não pode engolir um
+  // clique do usuário nem piscar o spinner a cada minuto.
+  if (!silencioso) {
+    btnConsultar.disabled = true;
+    btnAgora.disabled = true;
+    btnAtualizar.disabled = true;
+    statusEl.className = 'status-line';
+    statusEl.innerHTML = '<span class="spin"></span>'
+      + (forcar ? 'Atualizando' : 'Consultando') + ' ' + SALAS.length + ' salas...';
+  }
 
   try {
-    // allSettled: falha em uma sala não derruba a consulta das demais
-    const settled = await Promise.allSettled(
-      SALAS.map(async s => ({ ...s, dados: await carregarSala(s) })));
-    const resultados = [];
-    let falhas = 0;
-    for (const r of settled) {
-      if (r.status === 'fulfilled') resultados.push(r.value);
-      else falhas++;
-    }
-    if (!resultados.length) {
-      throw new Error(falhas + ' salas sem resposta (API indisponível?)');
+    // página aberta desde ontem: o rótulo de "Hoje" tem de acompanhar o dia
+    atualizarOpcoesDia();
+
+    let diaSemana;
+    if (selecao === 'hoje') {
+      // JS: 0=dom..6=sab ; API: 2=seg .. 7=sab
+      const js = diaSemanaDe(agoraBrasilia(instanteEmissao));
+      if (js === 0) {
+        // domingo: sem aulas na semana, estado explícito em vez de "tudo vazio"
+        // (dentro do try/finally: os botões sempre voltam a funcionar)
+        if (seq !== consultaSeq) return;
+        grid.innerHTML = '';
+        document.getElementById('nLivre').textContent = '–';
+        document.getElementById('nOcup').textContent = '–';
+        statusEl.className = 'status-line';
+        statusEl.textContent = 'Hoje é domingo — não há aulas nos anfiteatros.';
+        horaRenderizada = hhmm;
+        bloqueioAoVivoAte = 0;
+        return;
+      }
+      diaSemana = js + 1;
+    } else {
+      diaSemana = parseInt(selecao, 10);
     }
 
-    const diaTxt = diaSelect.value === 'hoje'
-      ? new Date().toLocaleDateString('pt-BR', { weekday: 'long', day: '2-digit', month: '2-digit' })
-      : DIAS_SEMANA[diaSemana];
-    const { semDados, ignorados } = render(resultados, diaSemana, minutos);
-    let txt = `Agenda de ${diaTxt} às ${hhmm} — ${resultados.length} salas`;
-    if (falhas) txt += ` · ${falhas} sem resposta`;
-    if (semDados) txt += ` · ${semDados} sem dados`;
-    if (ignorados) txt += ` · ⚠ ${ignorados} aula(s) com horário fora do padrão ignorada(s)`;
+    // allSettled: falha em uma sala não derruba a consulta das demais
+    const settled = await Promise.allSettled(
+      SALAS.map(async s => ({ ...s, dados: await carregarSala(s, forcar) })));
+
+    const resultados = [];
+    let erros = 0;
+    let motivo = '';
+    SALAS.forEach((sala, i) => {
+      const r = settled[i];
+      if (r.status === 'fulfilled') {
+        resultados.push(r.value);
+      } else {
+        erros++;
+        const msg = (r.reason && r.reason.message) || 'sem resposta';
+        if (!motivo) motivo = msg;
+        // a sala não desaparece da grade: o card dela mostra o erro
+        resultados.push({ ...sala, dados: null, erro: msg });
+      }
+    });
+    if (erros === SALAS.length) {
+      throw new Error(erros + ' salas sem resposta'
+        + (motivo ? ': ' + motivo : ' (API indisponível?)'));
+    }
+    if (seq !== consultaSeq) return; // uma consulta mais nova assumiu
+
+    // Virou o dia durante a consulta: "hoje" agora é outro dia, então refaz do
+    // zero com o dia novo (uma vez) em vez de misturar dia e dados.
+    if (selecao === 'hoje' && chaveDiaBrasilia() !== chaveEmissao) {
+      if (tentativasDia > 0) return consultar(forcar, tentativasDia - 1, modo);
+    }
+
+    // o retrato exibido passa a ser este: é para cá que o campo volta se uma
+    // atualização automática falhar
+    horaRenderizada = hhmm;
+    bloqueioAoVivoAte = 0;
+
+    const diaTxt = selecao === 'hoje' ? diaTextoHoje : DIAS_SEMANA[diaSemana];
+    const contagem = render(resultados, diaSemana, minutos);
+    let txt = `Agenda de ${diaTxt} às ${hhmm} — ${SALAS.length} salas`;
+    if (contagem.erros) txt += ` · ${contagem.erros} sem resposta`;
+    if (contagem.semDados) txt += ` · ${contagem.semDados} sem dados`;
+    if (contagem.incompletos) txt += ` · ⚠ ${contagem.incompletos} sala(s) com dados incompletos`;
+    // transparência: quanto tempo faz que estes dados saíram da API
+    const idade = idadeDoDado(resultados);
+    if (idade >= 5000) txt += ` · ${idadeTexto(idade)}`;
+    statusEl.className = 'status-line';
     statusEl.textContent = txt;
   } catch (e) {
+    if (seq !== consultaSeq) return; // obsoleta: não sobrescreve a consulta atual
+    if (silencioso) {
+      // falha passageira não pode apagar a tela que já estava correta
+      if (horaRenderizada) horaInput.value = horaRenderizada;
+      bloqueioAoVivoAte = Date.now() + ESPERA_APOS_FALHA_MS;
+      statusEl.className = 'status-line error';
+      statusEl.textContent = 'Falha ao atualizar automaticamente (' + e.message
+        + '). A tela mantém a última consulta.';
+      return;
+    }
+    // resultados antigos não podem ficar na tela: pareceriam atuais
+    grid.innerHTML = '';
+    document.getElementById('nLivre').textContent = '–';
+    document.getElementById('nOcup').textContent = '–';
     statusEl.className = 'status-line error';
     statusEl.textContent = 'Erro ao consultar a API da UnB: ' + e.message;
   } finally {
-    btnConsultar.disabled = false;
-    btnAgora.disabled = false;
+    consultasEmAndamento--;
+    if (!silencioso && seq === consultaSeq) {
+      btnConsultar.disabled = false;
+      btnAgora.disabled = false;
+      btnAtualizar.disabled = false;
+    }
   }
 }
 
+// "Agora" liga o modo ao vivo. Uma escolha manual o desliga, mas um horário
+// que coincide com o relógio (e "Hoje") continua sendo "agora".
+function sincronizarModoAgora() {
+  const valor = String(horaInput.value || '');
+  seguindoAgora = diaSelect.value === 'hoje' && RE_HORA.test(valor)
+    && valor === horaAgoraBrasilia();
+}
+
 btnAgora.addEventListener('click', () => {
-  const now = new Date();
-  horaInput.value = String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0');
+  horaInput.value = horaAgoraBrasilia();
   diaSelect.value = 'hoje';
+  atualizarOpcoesDia();
+  seguindoAgora = true;
+  consultar();
+});
+btnConsultar.addEventListener('click', () => {
+  sincronizarModoAgora();
+  consultar();
+});
+btnAtualizar.addEventListener('click', () => {
+  sincronizarModoAgora();
+  consultar(true);
+});
+horaInput.addEventListener('change', () => {
+  sincronizarModoAgora();
+  consultar();
+});
+diaSelect.addEventListener('change', () => {
+  sincronizarModoAgora();
   atualizarOpcoesDia();
   consultar();
 });
-btnConsultar.addEventListener('click', consultar);
-horaInput.addEventListener('change', consultar);
-diaSelect.addEventListener('change', atualizarOpcoesDia);
+
+// O painel nascia "agora" e ficava parado: às 09:55 ainda mostrava a aula que
+// acabava às 09:50 e só um F5 acertava a tela. Este tique só age quando a tela
+// acompanha o relógio (modo ao vivo), uma vez por minuto que vira, e é
+// silencioso: sem spinner, sem botões travados e sem sobrescrever a seleção de
+// quem escolheu outro dia/horário.
+function tiqueAoVivo() {
+  // Aba em segundo plano (celular bloqueado, outra aba): não gasta rede nem
+  // bateria. Ao voltar, o visibilitychange abaixo recupera o relógio na hora.
+  if (document.hidden) return;
+  // o rótulo "Hoje · <dia>" e a opção duplicada precisam acompanhar a virada
+  // também para quem está no modo manual (ex.: horário escolhido, dia "Hoje")
+  atualizarOpcoesDia();
+  if (!seguindoAgora || diaSelect.value !== 'hoje') return;
+  // O usuário está digitando no campo: o relógio não compete com ele.
+  if (document.activeElement === horaInput) return;
+  if (consultasEmAndamento > 0) return;
+  if (Date.now() < bloqueioAoVivoAte) return;
+
+  const agora = horaAgoraBrasilia();
+  if (agora === horaInput.value) return; // mesmo minuto: nada mudou
+  horaInput.value = agora;
+  consultar(false, 1, { silencioso: true });
+}
+
+setInterval(tiqueAoVivo, INTERVALO_AO_VIVO_MS);
+document.addEventListener('visibilitychange', () => {
+  // a aba voltou: o relógio pode ter andado enquanto os timers estavam parados
+  if (!document.hidden) tiqueAoVivo();
+});
 
 // Reflete o dia corrente no seletor: com "Hoje" selecionado, o rótulo mostra
-// o dia real ("Hoje · Sexta") e a opção duplicada desse mesmo dia fica
-// oculta — não faz sentido escolher hoje duas vezes. Ao selecionar um dia
-// específico, "Hoje" volta ao rótulo simples para não duplicar o dia na lista.
+// o dia real ("Hoje · Sexta") e a opção duplicada desse mesmo dia sai da lista.
+// Ao selecionar um dia específico, "Hoje" volta ao rótulo simples.
+//
+// O picker nativo do WebKit (Safari e todo navegador no iOS/iPadOS) ignora
+// option.hidden e option { display: none }: a única forma confiável de não
+// duplicar o dia de hoje é remover o nó <option> do DOM, o que exige remontar
+// a lista quando o dia ou a seleção mudam.
+const DIAS_OPCOES = [
+  { valor: '2', texto: 'Segunda-feira' },
+  { valor: '3', texto: 'Terça-feira' },
+  { valor: '4', texto: 'Quarta-feira' },
+  { valor: '5', texto: 'Quinta-feira' },
+  { valor: '6', texto: 'Sexta-feira' },
+  { valor: '7', texto: 'Sábado' },
+];
+
+// Última combinação (dia + seleção) que montou a lista. Remontar a cada
+// consulta fecharia o picker nativo aberto — e no modo ao vivo isso
+// aconteceria a cada minuto.
+let chaveOpcoesDia = null;
+
 function atualizarOpcoesDia() {
-  const js = new Date().getDay();
+  const js = diaSemanaAgora();
   const selecionadoHoje = diaSelect.value === 'hoje';
-  const hojeValor = js === 0 ? null : String(js + 1);
-  const hojeOpt = diaSelect.querySelector('option[value="hoje"]');
-  hojeOpt.textContent = selecionadoHoje
+  const diaDeHoje = js === 0 ? null : String(js + 1);
+  const selecaoAtual = diaSelect.value;
+  const chave = chaveDiaBrasilia() + '|' + selecaoAtual;
+  if (chave === chaveOpcoesDia) return;
+  chaveOpcoesDia = chave;
+
+  diaSelect.innerHTML = '';
+
+  const opHoje = document.createElement('option');
+  opHoje.value = 'hoje';
+  opHoje.textContent = selecionadoHoje
     ? (js === 0 ? 'Hoje (domingo)' : 'Hoje · ' + DIAS_SEMANA[js + 1])
     : 'Hoje';
-  diaSelect.querySelectorAll('option').forEach(o => {
-    if (o.value !== 'hoje') {
-      o.hidden = selecionadoHoje && o.value === hojeValor;
-    }
-  });
+  diaSelect.appendChild(opHoje);
+
+  for (const d of DIAS_OPCOES) {
+    // com "Hoje" selecionado, o dia de hoje não deve aparecer duas vezes
+    if (selecionadoHoje && d.valor === diaDeHoje) continue;
+    const op = document.createElement('option');
+    op.value = d.valor;
+    op.textContent = d.texto;
+    diaSelect.appendChild(op);
+  }
+
+  // a opção "hoje" existe sempre, então a seleção não se perde
+  diaSelect.value = selecaoAtual || 'hoje';
 }
 
 // começa no horário atual
 (function init() {
-  const now = new Date();
-  horaInput.value = String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0');
+  horaInput.value = horaAgoraBrasilia();
   atualizarOpcoesDia();
   consultar();
 })();
